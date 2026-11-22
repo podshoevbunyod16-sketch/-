@@ -1,0 +1,176 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI сборки форка: фронтенд (SvelteKit), бэкенд (FastAPI) и smoke-сборка образа.
+# Фронтенд собирается офлайн (без загрузки Pyodide с CDN) и выкладывается
+# артефактом, чтобы его можно было скачать прямо из вкладки Actions.
+#
+# Лог упавшего шага публикуется в комментарии к PR и в сводку запуска, чтобы
+# причину можно было увидеть без доступа к сырым логам Actions.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Build
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      docker_smoke:
+        description: 'Also build the Docker image (without pushing)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  NODE_VERSION: '22'
+  PYTHON_VERSION: '3.11'
+  # The frontend build never uses onnxruntime-node's CUDA binaries — same switch
+  # as in the Dockerfile; without it `npm ci` downloads gigabytes of CUDA wheels.
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
+  # Cypress is only used by the e2e suite, which this workflow does not run.
+  CYPRESS_INSTALL_BINARY: '0'
+
+jobs:
+  # ── Фронтенд: npm ci + vite build + артефакт ──────────────────────────────
+  webui:
+    name: WebUI (SvelteKit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - uses: actions/setup-node@v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        shell: bash
+        run: npm ci --force --no-audit --no-fund 2>&1 | tee .ci-npm-ci.log
+
+      - name: Verify bundled encryption artifact
+        shell: bash
+        run: npm run crypto:verify 2>&1 | tee .ci-crypto.log
+
+      - name: Unit tests
+        shell: bash
+        run: npm run test:frontend 2>&1 | tee .ci-tests.log
+
+      - name: Type check (informational)
+        # The upstream tree is not svelte-check clean, so this reports instead of failing.
+        continue-on-error: true
+        run: |
+          npx svelte-kit sync
+          npx svelte-check --tsconfig ./tsconfig.json --output human --threshold error
+
+      - name: Build the static frontend
+        # SKIP_PYODIDE_FETCH leaves the committed static/pyodide assets alone instead
+        # of downloading wheels from the Pyodide CDN.
+        shell: bash
+        run: npm run build 2>&1 | tee .ci-build.log
+        env:
+          SKIP_PYODIDE_FETCH: true
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      - name: Package the build output
+        run: |
+          test -d build
+          tar -czf "open-webui-frontend-${GITHUB_SHA::7}.tar.gz" -C build .
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: open-webui-frontend
+          path: open-webui-frontend-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report failure
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "### Build job failed (${GITHUB_SHA::7})"
+            for log in .ci-npm-ci.log .ci-crypto.log .ci-tests.log .ci-build.log; do
+              if [ -s "$log" ]; then
+                echo
+                echo "<details><summary>$log</summary>"
+                echo
+                echo '```'
+                tail -n 80 "$log"
+                echo '```'
+                echo
+                echo '</details>'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ github.event_name }}" = 'pull_request' ]; then
+            body=$(cat "$GITHUB_STEP_SUMMARY")
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${{ github.event.pull_request.number }}/comments" \
+              -F body="$body" || echo "::warning::could not publish the failure report"
+          fi
+
+  # ── Бэкенд: компиляция, линт и тесты реестра провайдеров ──────────────────
+  backend:
+    name: Backend checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install check tools
+        run: python -m pip install --upgrade pip "ruff>=0.15.5"
+
+      - name: Byte-compile the backend
+        run: python -m compileall -q backend/open_webui
+
+      - name: Ruff (errors only)
+        run: ruff check backend/open_webui --select E9,F63,F7,F82
+
+      - name: Ruff format check (fork modules)
+        run: ruff format --check backend/open_webui/routers/providers.py backend/tests
+
+      - name: Run provider registry tests
+        run: |
+          python -m pip install --quiet pytest fastapi pydantic aiohttp httpx
+          python -m pytest backend/tests -q
+
+  # ── Docker: проверка, что образ собирается (без публикации) ───────────────
+  docker-smoke:
+    name: Docker build (no push)
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.docker_smoke == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [webui, backend]
+
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - uses: docker/setup-buildx-action@v3.12.0
+
+      - name: Build the slim image
+        uses: docker/build-push-action@v5.4.0
+        with:
+          context: .
+          push: false
+          load: false
+          tags: open-webui:ci
+          build-args: |
+            USE_SLIM=true
+            BUILD_HASH=${{ github.sha }}
+            BUILD_CHANNEL=ci
+          cache-from: type=gha,scope=ci-slim
+          cache-to: type=gha,scope=ci-slim,mode=max
