@@ -1,0 +1,136 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI сборки форка: фронтенд (SvelteKit), бэкенд (FastAPI) и smoke-сборка образа
+# Фронтенд собирается офлайн (без загрузки Pyodide с CDN) и выкладывается
+# артефактом, чтобы его можно было скачать прямо из вкладки Actions.
+# ─────────────────────────────────────────────────────────────────────────────
+name: Build
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      docker_smoke:
+        description: 'Also build the Docker image (without pushing)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '22'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # ── Фронтенд: npm ci + vite build + артефакт ──────────────────────────────
+  webui:
+    name: WebUI (SvelteKit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - uses: actions/setup-node@v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify bundled encryption artifact
+        run: npm run crypto:verify
+
+      - name: Unit tests
+        run: npm run test:frontend
+
+      - name: Type check (informational)
+        # The upstream tree is not svelte-check clean, so this reports instead of failing.
+        continue-on-error: true
+        run: |
+          npx svelte-kit sync
+          npx svelte-check --tsconfig ./tsconfig.json --output human --threshold error
+
+      - name: Build the static frontend
+        # SKIP_PYODIDE_FETCH leaves the committed static/pyodide assets alone
+        # instead of downloading wheels from the Pyodide CDN.
+        run: npm run build
+        env:
+          SKIP_PYODIDE_FETCH: true
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      - name: Package the build output
+        run: tar -czf "open-webui-frontend-${GITHUB_SHA::7}.tar.gz" -C build .
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: open-webui-frontend
+          path: open-webui-frontend-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── Бэкенд: компиляция, линт и тесты реестра провайдеров ──────────────────
+  backend:
+    name: Backend checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install check tools
+        run: python -m pip install --upgrade pip "ruff>=0.15.5"
+
+      - name: Byte-compile the backend
+        run: python -m compileall -q backend/open_webui
+
+      - name: Ruff (errors only)
+        run: ruff check backend/open_webui --select E9,F63,F7,F82
+
+      - name: Ruff format check (fork modules)
+        run: ruff format --check backend/open_webui/routers/providers.py backend/tests
+
+      - name: Run provider registry tests
+        run: |
+          python -m pip install --quiet pytest fastapi pydantic aiohttp httpx
+          python -m pytest backend/tests -q
+
+  # ── Docker: проверка, что образ собирается (без публикации) ───────────────
+  docker-smoke:
+    name: Docker build (no push)
+    if: >-
+      github.event_name == 'workflow_dispatch' ? github.event.inputs.docker_smoke == 'true' : github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [webui, backend]
+
+    steps:
+      - uses: actions/checkout@v5.1.0
+
+      - uses: docker/setup-buildx-action@v3.12.0
+
+      - name: Build the slim image
+        uses: docker/build-push-action@v5.4.0
+        with:
+          context: .
+          push: false
+          load: false
+          tags: open-webui:ci
+          build-args: |
+            USE_SLIM=true
+            BUILD_HASH=${{ github.sha }}
+            BUILD_CHANNEL=ci
+          cache-from: type=gha,scope=ci-slim
+          cache-to: type=gha,scope=ci-slim,mode=max
