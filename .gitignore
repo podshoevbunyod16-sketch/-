@@ -315,3 +315,6 @@ cypress/screenshots
 
 # Local temporary fixtures and screenshots
 /tmp/
+
+# CI-диагностика (логи шагов, публикуемые в сводку запуска)
+.ci-*.log
