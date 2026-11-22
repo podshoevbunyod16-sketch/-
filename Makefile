@@ -31,3 +31,19 @@ update:
 	$(DOCKER_COMPOSE) up --build -d
 	$(DOCKER_COMPOSE) start
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Форк: локальные проверки, которые выполняет workflow "Build"
+# ─────────────────────────────────────────────────────────────────────────────
+check-frontend:
+	ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --force
+	npm run crypto:verify
+	SKIP_PYODIDE_FETCH=true npm run build
+
+check-backend:
+	python -m compileall -q backend/open_webui
+	ruff check backend/open_webui --select E9,F63,F7,F82
+	ruff format --check backend/open_webui/routers/providers.py backend/tests
+	python -m pytest backend/tests -q
+
+.PHONY: check-frontend check-backend

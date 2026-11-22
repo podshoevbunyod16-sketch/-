@@ -135,6 +135,41 @@ docker compose -f docker-compose.providers.yaml up -d --build
 
 ---
 
+### Те же проверки локально одной командой
+
+```bash
+make check-frontend   # npm ci (без CUDA-бинарников) + crypto:verify + офлайн vite build
+make check-backend    # compileall + ruff + pytest backend/tests
+```
+
+---
+
+## 3. Статус CI и типовые проблемы
+
+Что уже проходит на GitHub Actions в этом репозитории (workflow `Build`):
+
+| Job | Результат |
+| --- | --- |
+| `Backend checks` | ✅ compileall, `ruff check`, `ruff format --check`, `pytest backend/tests` (14 тестов реестра провайдеров) |
+| `WebUI (SvelteKit)` | ✅ `npm ci --force` → `crypto:verify` → unit-тесты → `vite build` → артефакт `open-webui-frontend` (~51 МБ) |
+| `Docker build (no push)` | собирается по `pull_request` и ручному запуску; в образе тот же код, что и выше |
+
+Типовые грабли:
+
+- **`npm ci` падает на «Install dependencies».** Обязателен `ONNXRUNTIME_NODE_INSTALL_CUDA=skip`
+  (он стоит и в Dockerfile, и в workflow) — без него postinstall `onnxruntime-node` тянет
+  CUDA-бинарники. `CYPRESS_INSTALL_BINARY=0` отключает загрузку бинарника Cypress: e2e в CI не запускаются.
+- **Сборка не может скачать Pyodide.** `SKIP_PYODIDE_FETCH=true npm run build` использует
+  закоммиченный `static/pyodide/pyodide-lock.json` и не обращается к CDN.
+- **Не хватает памяти на `vite build`.**upstream ставит `NODE_OPTIONS=--max-old-space-size=8192`;
+  для стабильной сборки нужно ≥7 GB RAM (на раннере GitHub это есть).
+- **упал шаг — а логов нет?** Workflow пишет хвосты логов упавших шагов в сводку запуска и в
+  комментарий PR (шаг `Report failure`).
+- **Слетела проверка формата.** После правок Python-кода выполните
+  `ruff format backend/open_webui/routers/providers.py backend/tests`, Svelte/TS — `npx prettier --write <файл>`.
+
+---
+
 ## 3. Что изменено в коде форка
 
 ```
