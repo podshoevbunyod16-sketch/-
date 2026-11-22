@@ -110,8 +110,8 @@ jobs:
   # ── Docker: проверка, что образ собирается (без публикации) ───────────────
   docker-smoke:
     name: Docker build (no push)
-    if: >-
-      github.event_name == 'workflow_dispatch' ? github.event.inputs.docker_smoke == 'true' : github.event_name == 'pull_request'
+    # GitHub not supporting a ternary inside `if:`, so both triggers are spelled out.
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.docker_smoke == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [webui, backend]
