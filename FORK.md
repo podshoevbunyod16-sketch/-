@@ -146,13 +146,13 @@ make check-backend    # compileall + ruff + pytest backend/tests
 
 ## 3. Статус CI и типовые проблемы
 
-Что уже проходит на GitHub Actions в этом репозитории (workflow `Build`):
+Что уже проходит на GitHub Actions в этом репозитории (проверено на пул-реквесте, commit `44bb78c`):
 
 | Job | Результат |
 | --- | --- |
 | `Backend checks` | ✅ compileall, `ruff check`, `ruff format --check`, `pytest backend/tests` (14 тестов реестра провайдеров) |
 | `WebUI (SvelteKit)` | ✅ `npm ci --force` → `crypto:verify` → unit-тесты → `vite build` → артефакт `open-webui-frontend` (~51 МБ) |
-| `Docker build (no push)` | собирается по `pull_request` и ручному запуску; в образе тот же код, что и выше |
+| `Docker build (no push)` | ✅ ~8 мин: `docker/build-push-action` собирает `USE_SLIM=true` образ целиком (frontend stage + Python) |
 
 Типовые грабли:
 
